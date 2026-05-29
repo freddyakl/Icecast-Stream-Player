@@ -1,0 +1,6 @@
+{
+  "name": "Icecast Stream Player",
+  "description": "A modern, accessible, responsive web audio player for Icecast streams featuring real-time metadata extraction, dynamic Last.fm album art integration, and playback history.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
