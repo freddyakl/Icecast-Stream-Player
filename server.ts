@@ -14,9 +14,84 @@ import dotenv from "dotenv";
 // Load environment variables
 dotenv.config();
 
+// Bypass SSL certificate issues for high-port Icecast stream metadata queries
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+
 // Create Express app
 const app = express();
 const PORT = 3000;
+
+/**
+ * Fallback helper function: Queries the Icecast status-json.xsl API standard
+ * to obtain real-time title/artist information cleanly without socket-level ICY stream reading.
+ */
+async function fetchIcecastJsonMetadata(streamUrl: string): Promise<{ title: string; artist: string } | null> {
+  try {
+    const parsedUrl = new URL(streamUrl);
+    const mountpoint = parsedUrl.pathname;
+    const jsonUrl = `${parsedUrl.protocol}//${parsedUrl.host}/status-json.xsl`;
+
+    const res = await fetch(jsonUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MixerFM/1.0',
+      }
+    });
+
+    if (!res.ok) {
+      throw new Error(`HTTP status ${res.status}`);
+    }
+
+    const data: any = await res.json();
+    if (!data || !data.icestats) {
+      return null;
+    }
+
+    const sources = data.icestats.source;
+    if (!sources) {
+      return null;
+    }
+
+    const sourceList = Array.isArray(sources) ? sources : [sources];
+    const cleanMount = mountpoint.startsWith('/') ? mountpoint.substring(1) : mountpoint;
+
+    let matchedSource = sourceList.find((s: any) => {
+      const listenUrl = s.listenurl || "";
+      const mount = s.mount || "";
+      return (
+        listenUrl.endsWith('/' + cleanMount) ||
+        listenUrl.endsWith(':' + cleanMount) ||
+        mount === cleanMount ||
+        mount === '/' + cleanMount
+      );
+    });
+
+    if (!matchedSource && sourceList.length > 0) {
+      matchedSource = sourceList[0];
+    }
+
+    if (matchedSource) {
+      const fullTitle = (matchedSource.title || "").trim();
+      const artist = (matchedSource.artist || "").trim();
+
+      if (artist && fullTitle && fullTitle !== artist) {
+        return { title: fullTitle, artist };
+      } else if (fullTitle) {
+        const parts = fullTitle.split(" - ");
+        if (parts.length >= 2) {
+          return {
+            artist: parts[0].trim(),
+            title: parts.slice(1).join(" - ").trim(),
+          };
+        }
+        return { title: fullTitle, artist: artist || "" };
+      }
+    }
+    return null;
+  } catch (error: any) {
+    console.error("fetchIcecastJsonMetadata error:", error.message);
+    return null;
+  }
+}
 
 /**
  * Helpler function: Fetches Icecast/Shoutcast real-time stream metadata (ICY)
@@ -32,6 +107,7 @@ function fetchIcyMetadata(streamUrl: string): Promise<{ title: string; artist: s
       const req = lib.request(
         streamUrl,
         {
+          rejectUnauthorized: false, // Override Certificate Authorization checks for private streams
           headers: {
             'Icy-Metadata': '1',
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) MixerFM/1.0',
@@ -179,6 +255,22 @@ app.get("/api/stream-metadata", async (req, res) => {
   }
 
   try {
+    // 1. Try standard Icecast JSON status API first as it is fast and reliable
+    console.log(`[Metadata] Querying JSON status metadata for ${streamUrl}`);
+    const jsonMeta = await fetchIcecastJsonMetadata(streamUrl);
+    if (jsonMeta && (jsonMeta.title || jsonMeta.artist)) {
+      console.log(`[Metadata] Found from status-json.xsl: "${jsonMeta.artist}" - "${jsonMeta.title}"`);
+      res.json({
+        artist: jsonMeta.artist || "Unknown Artist",
+        title: jsonMeta.title || "Unknown Track",
+        raw: "JSON_API",
+        timestamp: Date.now()
+      });
+      return;
+    }
+
+    // 2. Fallback to native ICY real-time stream socket reader
+    console.log(`[Metadata] Falling back to ICY socket stream reader for ${streamUrl}`);
     const meta = await fetchIcyMetadata(streamUrl);
     res.json({
       artist: meta.artist || "Unknown Artist",
